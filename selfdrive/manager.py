@@ -11,6 +11,7 @@ import datetime
 
 from common.basedir import BASEDIR, PARAMS
 from common.android import ANDROID
+WEBCAM = os.getenv("WEBCAM") is not None
 sys.path.append(os.path.join(BASEDIR, "pyextra"))
 os.environ['BASEDIR'] = BASEDIR
 
@@ -56,7 +57,10 @@ def unblock_stdout():
       except (OSError, IOError, UnicodeDecodeError):
         pass
 
-    os._exit(os.wait()[1])
+    # os.wait() returns a tuple with the pid and a 16 bit value
+    # whose low byte is the signal number and whose high byte is the exit satus
+    exit_status = os.wait()[1] >> 8
+    os._exit(exit_status)
 
 
 if __name__ == "__main__":
@@ -126,13 +130,14 @@ from selfdrive.version import version, dirty
 from selfdrive.loggerd.config import ROOT
 from selfdrive.launcher import launcher
 from common import android
-from common.apk import update_apks, pm_apply_packages, start_frame
+from common.apk import update_apks, pm_apply_packages, start_offroad
+from common.manager_helpers import print_cpu_usage
 
 ThermalStatus = cereal.log.ThermalData.ThermalStatus
 
 # comment out anything you don't want to run
 managed_processes = {
-  "thermald": "selfdrive.thermald",
+  "thermald": "selfdrive.thermald.thermald",
   "uploader": "selfdrive.loggerd.uploader",
   "deleter": "selfdrive.loggerd.deleter",
   "controlsd": "selfdrive.controls.controlsd",
@@ -186,6 +191,7 @@ persistent_processes = [
   'ui',
   'uploader',
 ]
+
 if ANDROID:
   persistent_processes += [
     'logcatd',
@@ -207,6 +213,12 @@ car_started_processes = [
   'ubloxd',
   'locationd',
 ]
+
+if WEBCAM:
+  car_started_processes += [
+    'dmonitoringmodeld',
+  ]
+
 if ANDROID:
   car_started_processes += [
     'sensord',
@@ -349,7 +361,7 @@ def manager_init(should_register=True):
   if should_register:
     reg_res = register()
     if reg_res:
-      dongle_id, dongle_secret = reg_res
+      dongle_id = reg_res
     else:
       raise Exception("server registration failed")
   else:
@@ -383,6 +395,9 @@ def manager_thread():
   # now loop
   thermal_sock = messaging.sub_sock('thermal')
 
+  if os.getenv("GET_CPU_USAGE"):
+    proc_sock = messaging.sub_sock('procLog', conflate=True)
+
   cloudlog.info("manager start")
   cloudlog.info({"environ": os.environ})
 
@@ -399,10 +414,10 @@ def manager_thread():
   for p in persistent_processes:
     start_managed_process(p)
 
-  # start frame
+  # start offroad
   if ANDROID:
     pm_apply_packages('enable')
-    start_frame()
+    start_offroad()
 
   if os.getenv("NOBOARD") is None:
     start_managed_process("pandad")
@@ -412,6 +427,9 @@ def manager_thread():
       del managed_processes[k]
 
   logger_dead = False
+
+  start_t = time.time()
+  first_proc = None
 
   while 1:
     msg = messaging.recv_sock(thermal_sock, wait=True)
@@ -447,6 +465,20 @@ def manager_thread():
     # Exit main loop when uninstall is needed
     if params.get("DoUninstall", encoding='utf8') == "1":
       break
+
+    if os.getenv("GET_CPU_USAGE"):
+      dt = time.time() - start_t
+
+      # Get first sample
+      if dt > 30 and first_proc is None:
+        first_proc = messaging.recv_sock(proc_sock)
+
+      # Get last sample and exit
+      if dt > 90:
+        last_proc = messaging.recv_sock(proc_sock, wait=True)
+
+        cleanup_all_processes(None, None)
+        sys.exit(print_cpu_usage(first_proc, last_proc))
 
 def manager_prepare(spinner=None):
   # build all processes
@@ -493,7 +525,7 @@ def main():
     ("LongitudinalControl", "0"),
     ("LimitSetSpeed", "0"),
     ("LimitSetSpeedNeural", "0"),
-    ("LastUpdateTime", datetime.datetime.now().isoformat().encode('utf8')),
+    ("LastUpdateTime", datetime.datetime.utcnow().isoformat().encode('utf8')),
     ("OpenpilotEnabledToggle", "1"),
     ("LaneChangeEnabled", "1"),
   ]
@@ -524,6 +556,8 @@ def main():
 
   try:
     manager_thread()
+  except SystemExit:
+    raise
   except Exception:
     traceback.print_exc()
     crash.capture_exception()

@@ -2,7 +2,7 @@ from cereal import car
 from selfdrive.config import Conversions as CV
 from selfdrive.controls.lib.drive_helpers import create_event, EventTypes as ET
 from selfdrive.car.volkswagen.values import CAR, BUTTON_STATES
-from common.params import Params
+from common.params import put_nonblocking
 from selfdrive.car import STD_CARGO_KG, scale_rot_inertia, scale_tire_stiffness, gen_empty_fingerprint
 from selfdrive.car.interfaces import CarInterfaceBase
 
@@ -22,6 +22,9 @@ class CarInterface(CarInterfaceBase):
   @staticmethod
   def get_params(candidate, fingerprint=gen_empty_fingerprint(), has_relay=False, car_fw=[]):
     ret = CarInterfaceBase.get_std_params(candidate, fingerprint, has_relay)
+
+    # VW port is a community feature, since we don't own one to test
+    ret.communityFeature = True
 
     if candidate == CAR.GOLF:
       # Set common MQB parameters that will apply globally
@@ -76,7 +79,6 @@ class CarInterface(CarInterfaceBase):
   def update(self, c, can_strings):
     canMonoTimes = []
     buttonEvents = []
-    params = Params()
 
     # Process the most recent CAN message traffic, and check for validity
     # The camera CAN has no signals we use at this time, but we process it
@@ -91,7 +93,7 @@ class CarInterface(CarInterfaceBase):
     # Update the EON metric configuration to match the car at first startup,
     # or if there's been a change.
     if self.CS.displayMetricUnits != self.displayMetricUnitsPrev:
-      params.put("IsMetric", "1" if self.CS.displayMetricUnits else "0")
+      put_nonblocking("IsMetric", "1" if self.CS.displayMetricUnits else "0")
 
     # Check for and process state-change events (button press or release) from
     # the turn stalk switch or ACC steering wheel/control stalk buttons.
@@ -104,21 +106,11 @@ class CarInterface(CarInterfaceBase):
 
     events = self.create_common_events(ret, extra_gears=[GEAR.eco, GEAR.sport])
 
-    # Vehicle operation safety checks and events
+    # Vehicle health and operation safety checks
     if self.CS.parkingBrakeSet:
       events.append(create_event('parkBrake', [ET.NO_ENTRY, ET.USER_DISABLE]))
-
-    # Vehicle health safety checks and events
-    if self.CS.accFault:
-      events.append(create_event('radarFault', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
     if self.CS.steeringFault:
       events.append(create_event('steerTempUnavailable', [ET.NO_ENTRY, ET.WARNING]))
-
-    # Per the Comma safety model, disable on pedals rising edge or when brake
-    # is pressed and speed isn't zero.
-    if (ret.gasPressed and not self.gas_pressed_prev) or \
-            (ret.brakePressed and (not self.brake_pressed_prev or not ret.standstill)):
-      events.append(create_event('pedalPressed', [ET.NO_ENTRY, ET.USER_DISABLE]))
 
     # Engagement and longitudinal control using stock ACC. Make sure OP is
     # disengaged if stock ACC is disengaged.
@@ -140,7 +132,7 @@ class CarInterface(CarInterfaceBase):
     self.buttonStatesPrev = self.CS.buttonStates.copy()
 
     self.CS.out = ret.as_reader()
-    return  self.CS.out
+    return self.CS.out
 
   def apply(self, c):
     can_sends = self.CC.update(c.enabled, self.CS, self.frame, c.actuators,
